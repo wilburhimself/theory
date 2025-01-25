@@ -1,6 +1,6 @@
 # Theory
 
-A lightweight and intuitive ORM for Go, inspired by the original Java version.
+A lightweight and intuitive ORM for Go, inspired by (the original Java version)[https://github.com/wilburhimself/theory_java].
 
 ## Features
 
@@ -255,8 +255,8 @@ if err != nil {
     panic(err)
 }
 for _, s := range status {
-    fmt.Printf("Migration: %s, Applied: %v, Batch: %d\n", 
-        s.Migration.Name, 
+    fmt.Printf("Migration: %s, Applied: %v, Batch: %d\n",
+        s.Migration.Name,
         s.Applied != nil,
         s.Batch)
 }
