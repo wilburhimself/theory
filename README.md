@@ -5,12 +5,12 @@ A lightweight and intuitive ORM for Go, inspired by the original Java version.
 ## Features
 
 - Simple and intuitive API for database operations
-- Support for multiple database backends (planned)
+- Support for SQLite (more databases planned)
 - Type-safe query building
 - Flexible model metadata definition
 - Customizable table and field names
-- Transaction support (planned)
-- Migration support (planned)
+- Robust error handling
+- Migration support
 - Connection pooling (planned)
 
 ## Installation
@@ -28,11 +28,15 @@ package main
 
 import (
     "github.com/wilburhimself/theory"
+    _ "github.com/mattn/go-sqlite3" // SQLite driver
 )
 
 func main() {
     // Initialize the ORM
-    db, err := theory.Connect("postgres", "postgres://user:pass@localhost:5432/dbname")
+    db, err := theory.Connect(theory.Config{
+        Driver: "sqlite3",
+        DSN:    "file:test.db?cache=shared&mode=memory",
+    })
     if err != nil {
         panic(err)
     }
@@ -107,6 +111,8 @@ func (u *User) ExtractMetadata() (*model.Metadata, error) {
 
 ### CRUD Operations
 
+All CRUD operations require a context:
+
 #### Create
 
 ```go
@@ -115,7 +121,7 @@ user := &User{
     Email: "john@example.com",
 }
 
-err := db.Create(user)
+err := db.Create(context.Background(), user)
 if err != nil {
     panic(err)
 }
@@ -126,63 +132,103 @@ if err != nil {
 Find a single record:
 ```go
 user := &User{}
-err := db.Find(user, "id = ?", 1)
+err := db.First(context.Background(), user, 1) // Find by primary key
+if err == theory.ErrRecordNotFound {
+    // Handle not found case
+}
 ```
 
 Find multiple records:
 ```go
 var users []User
-err := db.Find(&users, "age > ?", 18)
-```
-
-With query builder:
-```go
-var users []User
-err := db.NewQuery("users").
-    Select("id", "name").
-    Where("age > ?", 18).
-    OrderBy("name ASC").
-    Limit(10).
-    Offset(0).
-    Find(&users)
+err := db.Find(context.Background(), &users, "age > ?", 18)
 ```
 
 #### Update
 
 ```go
 user.Name = "Jane Doe"
-err := db.Update(user)
+err := db.Update(context.Background(), user)
 ```
 
 #### Delete
 
 ```go
-err := db.Delete(user)
+err := db.Delete(context.Background(), user)
 ```
 
-### Query Building
+### Database Migrations
 
-Theory provides a fluent query builder for constructing complex queries:
+Theory provides a robust migration system that supports both automatic migrations based on models and manual migrations for more complex schema changes.
+
+#### Auto Migrations
+
+The simplest way to manage your database schema is using auto-migrations:
 
 ```go
-query := db.NewQuery("users").
-    Select("id", "name", "email").
-    Where("age > ?", 18).
-    Where("status = ?", "active").
-    OrderBy("name ASC").
-    Limit(10).
-    Offset(20)
+type User struct {
+    ID        int       `db:"id,pk,auto"`
+    Name      string    `db:"name"`
+    Email     string    `db:"email,null"`
+    CreatedAt time.Time `db:"created_at"`
+}
 
-var users []User
-err := query.Find(&users)
+// Create or update tables based on models
+err := db.AutoMigrate(&User{})
+if err != nil {
+    panic(err)
+}
 ```
 
-Available query methods:
-- `Select(...columns)`: Specify columns to select
-- `Where(condition, ...args)`: Add WHERE conditions
-- `OrderBy(expr)`: Add ORDER BY clause
-- `Limit(n)`: Add LIMIT clause
-- `Offset(n)`: Add OFFSET clause
+#### Manual Migrations
+
+For more complex schema changes, you can create manual migrations:
+
+```go
+func createUserMigration() *migration.Migration {
+    m := migration.NewMigration("create_users_table")
+
+    // Define up operations
+    m.Up = []migration.Operation{
+        &migration.CreateTable{
+            Name: "users",
+            Columns: []migration.Column{
+                {Name: "id", Type: "INTEGER", IsPK: true, IsAuto: true},
+                {Name: "name", Type: "TEXT", IsNull: false},
+                {Name: "email", Type: "TEXT", IsNull: true},
+            },
+        },
+    }
+
+    // Define down operations
+    m.Down = []migration.Operation{
+        &migration.DropTable{Name: "users"},
+    }
+
+    return m
+}
+
+// Add and run migration
+migrator := db.Migrator()
+migrator.Add(createUserMigration())
+err := migrator.Up()
+```
+
+## Error Handling
+
+Theory provides clear error types for common scenarios:
+
+```go
+// Record not found
+if err == theory.ErrRecordNotFound {
+    // Handle not found case
+}
+
+// Other errors
+if err != nil {
+    // Handle other errors
+}
+```
 
 ## Contributing
 

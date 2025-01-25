@@ -3,37 +3,58 @@ package theory
 import (
 	"context"
 	"database/sql"
-	"errors"
 	"fmt"
 	"reflect"
 	"strings"
 
+	"github.com/wilburhimself/theory/migration"
 	"github.com/wilburhimself/theory/model"
 )
 
 // DB represents a Theory database instance
 type DB struct {
-	conn *sql.DB
+	conn     *sql.DB
+	driver   string
+	migrator *migration.Migrator
 }
 
-// Config holds the database configuration
+// Config holds database connection configuration
 type Config struct {
 	Driver string
 	DSN    string
 }
 
-// Connect establishes a connection to the database using the provided configuration
-func Connect(driver, dsn string) (*DB, error) {
-	conn, err := sql.Open(driver, dsn)
+// ErrRecordNotFound is returned when a record is not found
+var ErrRecordNotFound = fmt.Errorf("record not found")
+
+// Connect establishes a database connection
+func Connect(cfg Config) (*DB, error) {
+	conn, err := sql.Open(cfg.Driver, cfg.DSN)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to open database: %w", err)
 	}
 
-	if err := conn.Ping(); err != nil {
-		return nil, err
+	// Test connection
+	err = conn.Ping()
+	if err != nil {
+		conn.Close()
+		return nil, fmt.Errorf("failed to ping database: %w", err)
 	}
 
-	return &DB{conn: conn}, nil
+	db := &DB{
+		conn:   conn,
+		driver: cfg.Driver,
+	}
+
+	// Initialize migrator
+	db.migrator = migration.NewMigrator(conn)
+	err = db.migrator.Initialize()
+	if err != nil {
+		conn.Close()
+		return nil, fmt.Errorf("failed to initialize migrator: %w", err)
+	}
+
+	return db, nil
 }
 
 // Close closes the database connection
@@ -41,23 +62,100 @@ func (db *DB) Close() error {
 	return db.conn.Close()
 }
 
+// Migrator returns the database migrator
+func (db *DB) Migrator() *migration.Migrator {
+	return db.migrator
+}
+
+// AutoMigrate creates or updates database tables based on the given models
+func (db *DB) AutoMigrate(models ...interface{}) error {
+	for _, m := range models {
+		// Create migration
+		metadata, err := model.ExtractMetadata(m)
+		if err != nil {
+			return err
+		}
+
+		// Create table operation
+		createTable := &migration.CreateTable{
+			Name:    metadata.TableName,
+			Columns: make([]migration.Column, 0),
+		}
+
+		// Convert model fields to columns
+		for _, field := range metadata.Fields {
+			col := migration.Column{
+				Name:   field.DBName,
+				Type:   migration.SqlType(field.Type),
+				IsPK:   field.IsPK,
+				IsAuto: field.IsAuto,
+				IsNull: field.IsNull,
+			}
+			createTable.Columns = append(createTable.Columns, col)
+		}
+
+		// Create migration
+		mig := migration.NewMigration(fmt.Sprintf("create_%s", metadata.TableName))
+		mig.Up = []migration.Operation{createTable}
+		mig.Down = []migration.Operation{
+			&migration.DropTable{Name: metadata.TableName},
+		}
+
+		// Add and run migration
+		db.migrator.Add(mig)
+		err = db.migrator.Up()
+		if err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
 // Create inserts a new record into the database
-func (db *DB) Create(ctx context.Context, model interface{}) error {
-	metadata, err := extractModelMetadata(model)
+func (db *DB) Create(ctx context.Context, m interface{}) error {
+	metadata, err := model.ExtractMetadata(m)
 	if err != nil {
-		return fmt.Errorf("failed to extract model metadata: %w", err)
+		return err
 	}
 
-	query, args := db.buildInsertQuery(metadata, model)
-	result, err := db.conn.ExecContext(ctx, query, args...)
-	if err != nil {
-		return fmt.Errorf("failed to execute insert query: %w", err)
+	// Build query
+	var columns []string
+	var placeholders []string
+	var values []interface{}
+
+	v := reflect.ValueOf(m)
+	if v.Kind() == reflect.Ptr {
+		v = v.Elem()
 	}
 
-	// If the model has an auto-increment primary key, update it
+	for _, field := range metadata.Fields {
+		if !field.IsAuto {
+			columns = append(columns, field.DBName)
+			placeholders = append(placeholders, "?")
+			values = append(values, v.FieldByName(field.Name).Interface())
+		}
+	}
+
+	sql := fmt.Sprintf("INSERT INTO %s (%s) VALUES (%s)",
+		metadata.TableName,
+		strings.Join(columns, ", "),
+		strings.Join(placeholders, ", "),
+	)
+
+	// Execute query
+	result, err := db.conn.ExecContext(ctx, sql, values...)
+	if err != nil {
+		return err
+	}
+
+	// Get last insert ID if available
 	if id, err := result.LastInsertId(); err == nil {
-		if pk := metadata.PrimaryKey(); pk != nil && pk.IsAuto {
-			reflect.ValueOf(model).Elem().FieldByName(pk.Name).SetInt(id)
+		for _, field := range metadata.Fields {
+			if field.IsAuto {
+				v.FieldByName(field.Name).SetInt(id)
+				break
+			}
 		}
 	}
 
@@ -65,186 +163,199 @@ func (db *DB) Create(ctx context.Context, model interface{}) error {
 }
 
 // Find retrieves records from the database
-func (db *DB) Find(ctx context.Context, dest interface{}, query string, args ...interface{}) error {
-	rows, err := db.conn.QueryContext(ctx, query, args...)
+func (db *DB) Find(ctx context.Context, dest interface{}, where string, args ...interface{}) error {
+	// Get metadata from destination type
+	destType := reflect.TypeOf(dest)
+	if destType.Kind() != reflect.Ptr {
+		return fmt.Errorf("destination must be a pointer")
+	}
+
+	elemType := destType.Elem()
+	isSlice := elemType.Kind() == reflect.Slice
+	if isSlice {
+		elemType = elemType.Elem()
+	}
+
+	if elemType.Kind() == reflect.Ptr {
+		elemType = elemType.Elem()
+	}
+
+	metadata, err := model.ExtractMetadata(reflect.New(elemType).Interface())
 	if err != nil {
-		return fmt.Errorf("failed to execute query: %w", err)
+		return err
+	}
+
+	// Build query
+	sql := fmt.Sprintf("SELECT * FROM %s", metadata.TableName)
+	if where != "" {
+		sql += " WHERE " + where
+	}
+
+	// Execute query
+	rows, err := db.conn.QueryContext(ctx, sql, args...)
+	if err != nil {
+		return err
 	}
 	defer rows.Close()
 
-	return db.scanRows(rows, dest)
-}
-
-// Update updates records in the database
-func (db *DB) Update(ctx context.Context, model interface{}) error {
-	metadata, err := extractModelMetadata(model)
-	if err != nil {
-		return fmt.Errorf("failed to extract model metadata: %w", err)
+	var results reflect.Value
+	if isSlice {
+		results = reflect.MakeSlice(reflect.SliceOf(elemType), 0, 0)
 	}
 
-	query, args := db.buildUpdateQuery(metadata, model)
-	_, err = db.conn.ExecContext(ctx, query, args...)
-	if err != nil {
-		return fmt.Errorf("failed to execute update query: %w", err)
-	}
-
-	return nil
-}
-
-// Delete removes records from the database
-func (db *DB) Delete(ctx context.Context, model interface{}) error {
-	metadata, err := extractModelMetadata(model)
-	if err != nil {
-		return fmt.Errorf("failed to extract model metadata: %w", err)
-	}
-
-	query, args := db.buildDeleteQuery(metadata, model)
-	_, err = db.conn.ExecContext(ctx, query, args...)
-	if err != nil {
-		return fmt.Errorf("failed to execute delete query: %w", err)
-	}
-
-	return nil
-}
-
-// Helper methods for SQL generation
-
-func (db *DB) buildInsertQuery(metadata *model.Metadata, model interface{}) (string, []interface{}) {
-	val := reflect.ValueOf(model).Elem()
-	var columns []string
-	var placeholders []string
-	var args []interface{}
-
-	for _, field := range metadata.Fields {
-		// Skip auto-increment primary keys
-		if field.IsPK && field.IsAuto {
-			continue
+	found := false
+	for rows.Next() {
+		found = true
+		// Create a new instance of the model
+		modelInstance := reflect.New(elemType)
+		if modelInstance.Kind() == reflect.Ptr {
+			modelInstance = modelInstance.Elem()
 		}
 
-		columns = append(columns, field.DBName)
-		placeholders = append(placeholders, "?")
-		args = append(args, val.FieldByName(field.Name).Interface())
+		// Create a slice of pointers to scan into
+		var scanDest []interface{}
+		for _, field := range metadata.Fields {
+			scanDest = append(scanDest, modelInstance.FieldByName(field.Name).Addr().Interface())
+		}
+
+		// Scan row into model
+		err := rows.Scan(scanDest...)
+		if err != nil {
+			return err
+		}
+
+		if isSlice {
+			results = reflect.Append(results, modelInstance)
+		} else {
+			reflect.ValueOf(dest).Elem().Set(modelInstance)
+			break
+		}
 	}
 
-	query := fmt.Sprintf(
-		"INSERT INTO %s (%s) VALUES (%s)",
-		metadata.TableName,
-		strings.Join(columns, ", "),
-		strings.Join(placeholders, ", "),
-	)
+	if err := rows.Err(); err != nil {
+		return err
+	}
 
-	return query, args
+	if !isSlice && !found {
+		return ErrRecordNotFound
+	}
+
+	if isSlice {
+		reflect.ValueOf(dest).Elem().Set(results)
+	}
+
+	return nil
 }
 
-func (db *DB) buildUpdateQuery(metadata *model.Metadata, model interface{}) (string, []interface{}) {
-	val := reflect.ValueOf(model).Elem()
+// First retrieves the first record matching the given ID
+func (db *DB) First(ctx context.Context, dest interface{}, id interface{}) error {
+	metadata, err := model.ExtractMetadata(dest)
+	if err != nil {
+		return err
+	}
+
+	// Find primary key field
+	var pkField *model.Field
+	for i := range metadata.Fields {
+		if metadata.Fields[i].IsPK {
+			pkField = &metadata.Fields[i]
+			break
+		}
+	}
+
+	if pkField == nil {
+		return fmt.Errorf("no primary key field found")
+	}
+
+	err = db.Find(ctx, dest, fmt.Sprintf("%s = ?", pkField.DBName), id)
+	if err == ErrRecordNotFound {
+		return ErrRecordNotFound
+	}
+	return err
+}
+
+// Update updates a record in the database
+func (db *DB) Update(ctx context.Context, m interface{}) error {
+	metadata, err := model.ExtractMetadata(m)
+	if err != nil {
+		return err
+	}
+
+	// Build query
 	var setColumns []string
-	var args []interface{}
+	var values []interface{}
+	var pkField *model.Field
+	var pkValue interface{}
 
-	// Build SET clause
-	for _, field := range metadata.Fields {
+	v := reflect.ValueOf(m)
+	if v.Kind() == reflect.Ptr {
+		v = v.Elem()
+	}
+
+	for i := range metadata.Fields {
+		field := &metadata.Fields[i]
 		if field.IsPK {
-			continue
+			pkField = field
+			pkValue = v.FieldByName(field.Name).Interface()
+		} else {
+			setColumns = append(setColumns, fmt.Sprintf("%s = ?", field.DBName))
+			values = append(values, v.FieldByName(field.Name).Interface())
 		}
-		setColumns = append(setColumns, fmt.Sprintf("%s = ?", field.DBName))
-		args = append(args, val.FieldByName(field.Name).Interface())
 	}
 
-	// Add WHERE clause for primary key
-	var whereClause string
-	if pk := metadata.PrimaryKey(); pk != nil {
-		whereClause = fmt.Sprintf("WHERE %s = ?", pk.DBName)
-		args = append(args, val.FieldByName(pk.Name).Interface())
+	if pkField == nil {
+		return fmt.Errorf("no primary key field found")
 	}
 
-	query := fmt.Sprintf(
-		"UPDATE %s SET %s %s",
+	// Add primary key value to values
+	values = append(values, pkValue)
+
+	sql := fmt.Sprintf("UPDATE %s SET %s WHERE %s = ?",
 		metadata.TableName,
 		strings.Join(setColumns, ", "),
-		whereClause,
+		pkField.DBName,
 	)
 
-	return query, args
+	// Execute query
+	_, err = db.conn.ExecContext(ctx, sql, values...)
+	return err
 }
 
-func (db *DB) buildDeleteQuery(metadata *model.Metadata, model interface{}) (string, []interface{}) {
-	val := reflect.ValueOf(model).Elem()
-	var args []interface{}
-
-	// Build WHERE clause for primary key
-	var whereClause string
-	if pk := metadata.PrimaryKey(); pk != nil {
-		whereClause = fmt.Sprintf("WHERE %s = ?", pk.DBName)
-		args = append(args, val.FieldByName(pk.Name).Interface())
-	}
-
-	query := fmt.Sprintf("DELETE FROM %s %s", metadata.TableName, whereClause)
-	return query, args
-}
-
-func (db *DB) scanRows(rows *sql.Rows, dest interface{}) error {
-	destVal := reflect.ValueOf(dest)
-	if destVal.Kind() != reflect.Ptr {
-		return errors.New("destination must be a pointer")
-	}
-	destVal = destVal.Elem()
-
-	// Get the type of the slice elements
-	sliceType := destVal.Type()
-	if sliceType.Kind() != reflect.Slice {
-		return errors.New("destination must be a pointer to slice")
-	}
-	elemType := sliceType.Elem()
-
-	// Get column names
-	columns, err := rows.Columns()
+// Delete deletes a record from the database
+func (db *DB) Delete(ctx context.Context, m interface{}) error {
+	metadata, err := model.ExtractMetadata(m)
 	if err != nil {
-		return fmt.Errorf("failed to get column names: %w", err)
+		return err
 	}
 
-	for rows.Next() {
-		// Create a new element
-		elem := reflect.New(elemType).Elem()
+	// Find primary key
+	var pkField *model.Field
+	var pkValue interface{}
 
-		// Create a slice of interface{} to hold the values
-		values := make([]interface{}, len(columns))
-		for i := range values {
-			values[i] = new(interface{})
-		}
-
-		// Scan the row into the interface{} slice
-		if err := rows.Scan(values...); err != nil {
-			return fmt.Errorf("failed to scan row: %w", err)
-		}
-
-		// Set the values on the struct fields
-		for i, col := range columns {
-			field := elem.FieldByName(toFieldName(col))
-			if field.IsValid() {
-				val := reflect.ValueOf(values[i]).Elem().Interface()
-				if val != nil {
-					field.Set(reflect.ValueOf(val))
-				}
-			}
-		}
-
-		// Append the element to the result slice
-		destVal.Set(reflect.Append(destVal, elem))
+	v := reflect.ValueOf(m)
+	if v.Kind() == reflect.Ptr {
+		v = v.Elem()
 	}
 
-	return rows.Err()
-}
-
-// Helper function to convert database column names to struct field names
-func toFieldName(column string) string {
-	parts := strings.Split(column, "_")
-	for i := range parts {
-		parts[i] = strings.Title(parts[i])
+	for i := range metadata.Fields {
+		field := &metadata.Fields[i]
+		if field.IsPK {
+			pkField = field
+			pkValue = v.FieldByName(field.Name).Interface()
+			break
+		}
 	}
-	return strings.Join(parts, "")
-}
 
-// Helper function to extract model metadata
-func extractModelMetadata(m interface{}) (*model.Metadata, error) {
-	return model.ExtractMetadata(m)
+	if pkField == nil {
+		return fmt.Errorf("no primary key field found")
+	}
+
+	sql := fmt.Sprintf("DELETE FROM %s WHERE %s = ?",
+		metadata.TableName,
+		pkField.DBName,
+	)
+
+	// Execute query
+	_, err = db.conn.ExecContext(ctx, sql, pkValue)
+	return err
 }

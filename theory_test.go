@@ -3,6 +3,8 @@ package theory
 import (
 	"context"
 	"testing"
+
+	_ "github.com/mattn/go-sqlite3"
 )
 
 type TestUser struct {
@@ -11,34 +13,50 @@ type TestUser struct {
 	Email string `db:"email"`
 }
 
-func TestConnect(t *testing.T) {
-	// This test requires a real database connection
-	// You should set up a test database and provide credentials
-	t.Skip("Requires database setup")
+func setupTestDB(t *testing.T) (*DB, func()) {
+	cfg := Config{
+		Driver: "sqlite3",
+		DSN:    ":memory:",
+	}
 
-	db, err := Connect("postgres", "postgres://user:pass@localhost:5432/testdb")
+	db, err := Connect(cfg)
 	if err != nil {
 		t.Fatalf("failed to connect to database: %v", err)
 	}
-	defer db.Close()
+
+	// Create test tables
+	err = db.AutoMigrate(&TestUser{})
+	if err != nil {
+		db.Close()
+		t.Fatalf("failed to create tables: %v", err)
+	}
+
+	cleanup := func() {
+		db.Close()
+	}
+
+	return db, cleanup
+}
+
+func TestConnect(t *testing.T) {
+	db, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	if db == nil {
+		t.Error("expected db to not be nil")
+	}
 }
 
 func TestCreate(t *testing.T) {
-	// This test requires a real database connection
-	t.Skip("Requires database setup")
-
-	db, err := Connect("postgres", "postgres://user:pass@localhost:5432/testdb")
-	if err != nil {
-		t.Fatalf("failed to connect to database: %v", err)
-	}
-	defer db.Close()
+	db, cleanup := setupTestDB(t)
+	defer cleanup()
 
 	user := &TestUser{
 		Name:  "Test User",
 		Email: "test@example.com",
 	}
 
-	err = db.Create(context.Background(), user)
+	err := db.Create(context.Background(), user)
 	if err != nil {
 		t.Fatalf("failed to create user: %v", err)
 	}
@@ -49,57 +67,91 @@ func TestCreate(t *testing.T) {
 }
 
 func TestFind(t *testing.T) {
-	// This test requires a real database connection
-	t.Skip("Requires database setup")
+	db, cleanup := setupTestDB(t)
+	defer cleanup()
 
-	db, err := Connect("postgres", "postgres://user:pass@localhost:5432/testdb")
-	if err != nil {
-		t.Fatalf("failed to connect to database: %v", err)
+	// Create a test user first
+	user := &TestUser{
+		Name:  "Test User",
+		Email: "test@example.com",
 	}
-	defer db.Close()
+	err := db.Create(context.Background(), user)
+	if err != nil {
+		t.Fatalf("failed to create test user: %v", err)
+	}
 
 	var users []TestUser
-	err = db.Find(context.Background(), &users, "SELECT * FROM users WHERE name = ?", "Test User")
+	err = db.Find(context.Background(), &users, "name = ?", "Test User")
 	if err != nil {
 		t.Fatalf("failed to find users: %v", err)
+	}
+
+	if len(users) != 1 {
+		t.Errorf("expected 1 user, got %d", len(users))
+	}
+
+	if users[0].Name != "Test User" {
+		t.Errorf("expected user name to be 'Test User', got '%s'", users[0].Name)
 	}
 }
 
 func TestUpdate(t *testing.T) {
-	// This test requires a real database connection
-	t.Skip("Requires database setup")
+	db, cleanup := setupTestDB(t)
+	defer cleanup()
 
-	db, err := Connect("postgres", "postgres://user:pass@localhost:5432/testdb")
-	if err != nil {
-		t.Fatalf("failed to connect to database: %v", err)
-	}
-	defer db.Close()
-
+	// Create a test user first
 	user := &TestUser{
-		ID:    1,
-		Name:  "Updated User",
-		Email: "updated@example.com",
+		Name:  "Test User",
+		Email: "test@example.com",
+	}
+	err := db.Create(context.Background(), user)
+	if err != nil {
+		t.Fatalf("failed to create test user: %v", err)
 	}
 
+	// Update the user
+	user.Name = "Updated User"
 	err = db.Update(context.Background(), user)
 	if err != nil {
 		t.Fatalf("failed to update user: %v", err)
 	}
+
+	// Verify the update
+	var updatedUser TestUser
+	err = db.First(context.Background(), &updatedUser, user.ID)
+	if err != nil {
+		t.Fatalf("failed to get updated user: %v", err)
+	}
+
+	if updatedUser.Name != "Updated User" {
+		t.Errorf("expected user name to be 'Updated User', got '%s'", updatedUser.Name)
+	}
 }
 
 func TestDelete(t *testing.T) {
-	// This test requires a real database connection
-	t.Skip("Requires database setup")
+	db, cleanup := setupTestDB(t)
+	defer cleanup()
 
-	db, err := Connect("postgres", "postgres://user:pass@localhost:5432/testdb")
-	if err != nil {
-		t.Fatalf("failed to connect to database: %v", err)
+	// Create a test user first
+	user := &TestUser{
+		Name:  "Test User",
+		Email: "test@example.com",
 	}
-	defer db.Close()
+	err := db.Create(context.Background(), user)
+	if err != nil {
+		t.Fatalf("failed to create test user: %v", err)
+	}
 
-	user := &TestUser{ID: 1}
+	// Delete the user
 	err = db.Delete(context.Background(), user)
 	if err != nil {
 		t.Fatalf("failed to delete user: %v", err)
+	}
+
+	// Verify the deletion
+	var deletedUser TestUser
+	err = db.First(context.Background(), &deletedUser, user.ID)
+	if err == nil {
+		t.Error("expected error when getting deleted user")
 	}
 }
