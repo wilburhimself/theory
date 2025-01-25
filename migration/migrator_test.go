@@ -7,17 +7,19 @@ import (
 	_ "github.com/mattn/go-sqlite3"
 )
 
-func setupTestDB(t *testing.T) *sql.DB {
+func setupTestDB(t *testing.T) (*sql.DB, func()) {
 	db, err := sql.Open("sqlite3", ":memory:")
 	if err != nil {
 		t.Fatalf("Failed to open test database: %v", err)
 	}
-	return db
+	return db, func() {
+		db.Close()
+	}
 }
 
 func TestMigrator(t *testing.T) {
-	db := setupTestDB(t)
-	defer db.Close()
+	db, cleanup := setupTestDB(t)
+	defer cleanup()
 
 	migrator := NewMigrator(db)
 
@@ -50,105 +52,171 @@ func TestMigrator(t *testing.T) {
 		},
 	}
 	migration2.Down = []Operation{
-		&DropColumn{
-			Table:  "users",
-			Column: "email",
-		},
+		&DropColumn{Table: "users", Column: "email"},
 	}
 
-	// Add migrations
+	// Test Add
 	migrator.Add(migration1)
 	migrator.Add(migration2)
 
-	// Test Up
-	err = migrator.Up()
+	// Test Up with batch
+	err = migrator.UpWithBatch(true)
 	if err != nil {
-		t.Fatalf("Migrator.Up() error = %v", err)
+		t.Fatalf("Migrator.UpWithBatch() error = %v", err)
 	}
 
-	// Check if migrations were applied
-	applied, err := migrator.GetAppliedMigrations()
-	if err != nil {
-		t.Fatalf("Migrator.GetAppliedMigrations() error = %v", err)
-	}
-
-	if len(applied) != 2 {
-		t.Errorf("len(applied) = %v, want %v", len(applied), 2)
-	}
-
-	// Test Down
-	err = migrator.Down()
-	if err != nil {
-		t.Fatalf("Migrator.Down() error = %v", err)
-	}
-
-	// Check if last migration was rolled back
-	applied, err = migrator.GetAppliedMigrations()
-	if err != nil {
-		t.Fatalf("Migrator.GetAppliedMigrations() error = %v", err)
-	}
-
-	if len(applied) != 1 {
-		t.Errorf("len(applied) = %v, want %v", len(applied), 1)
-	}
-
-	// Test Status
+	// Verify migrations were applied
 	status, err := migrator.Status()
 	if err != nil {
 		t.Fatalf("Migrator.Status() error = %v", err)
 	}
 
 	if len(status) != 2 {
-		t.Errorf("len(status) = %v, want %v", len(status), 2)
+		t.Errorf("got %d migrations, want 2", len(status))
 	}
 
-	if status[0].Migration.ID != migration1.ID {
-		t.Errorf("status[0].Migration.ID = %v, want %v", status[0].Migration.ID, migration1.ID)
+	for _, s := range status {
+		if s.Applied == nil {
+			t.Errorf("migration %s not applied", s.Migration.Name)
+		}
+		if s.Batch != 1 {
+			t.Errorf("migration %s batch = %d, want 1", s.Migration.Name, s.Batch)
+		}
 	}
 
-	if status[1].Migration.ID != migration2.ID {
-		t.Errorf("status[1].Migration.ID = %v, want %v", status[1].Migration.ID, migration2.ID)
+	// Create and run second batch
+	migration3 := NewMigration("add_user_index")
+	migration3.Up = []Operation{
+		&CreateIndex{
+			Table: "users",
+			Index: Index{
+				Name:     "idx_users_email",
+				Columns:  []string{"email"},
+				IsUnique: true,
+			},
+		},
+	}
+	migration3.Down = []Operation{
+		&DropIndex{Table: "users", Name: "idx_users_email"},
+	}
+
+	migrator.Add(migration3)
+	err = migrator.UpWithBatch(true)
+	if err != nil {
+		t.Fatalf("Migrator.UpWithBatch() error = %v", err)
+	}
+
+	// Verify second batch
+	status, err = migrator.Status()
+	if err != nil {
+		t.Fatalf("Migrator.Status() error = %v", err)
+	}
+
+	if len(status) != 3 {
+		t.Errorf("got %d migrations, want 3", len(status))
+	}
+
+	found := false
+	for _, s := range status {
+		if s.Migration.Name == "add_user_index" {
+			found = true
+			if s.Applied == nil {
+				t.Error("migration add_user_index not applied")
+			}
+			if s.Batch != 2 {
+				t.Errorf("migration add_user_index batch = %d, want 2", s.Batch)
+			}
+		}
+	}
+
+	if !found {
+		t.Error("migration add_user_index not found")
+	}
+
+	// Test Down with batch
+	err = migrator.DownWithBatch(true)
+	if err != nil {
+		t.Fatalf("Migrator.DownWithBatch() error = %v", err)
+	}
+
+	// Verify rollback
+	status, err = migrator.Status()
+	if err != nil {
+		t.Fatalf("Migrator.Status() error = %v", err)
+	}
+
+	for _, s := range status {
+		if s.Migration.Name == "add_user_index" {
+			if s.Applied != nil {
+				t.Error("migration add_user_index still applied after rollback")
+			}
+		} else {
+			if s.Applied == nil {
+				t.Errorf("migration %s rolled back unexpectedly", s.Migration.Name)
+			}
+		}
 	}
 }
 
 func TestMigratorErrorHandling(t *testing.T) {
-	db := setupTestDB(t)
-	defer db.Close()
+	db, cleanup := setupTestDB(t)
+	defer cleanup()
 
 	migrator := NewMigrator(db)
 
-	// Test Initialize
+	// Test Initialize error handling
 	err := migrator.Initialize()
 	if err != nil {
 		t.Fatalf("Migrator.Initialize() error = %v", err)
 	}
 
-	// Create an invalid migration
-	migration := NewMigration("invalid_migration")
-	migration.Up = []Operation{
+	// Verify migrations table exists
+	var count int
+	err = db.QueryRow("SELECT COUNT(*) FROM migrations").Scan(&count)
+	if err != nil {
+		t.Fatalf("Failed to query migrations table: %v", err)
+	}
+
+	if count > 0 {
+		t.Error("migrations table contains rows after initialization")
+	}
+
+	// Test invalid SQL in migration
+	invalidMigration := NewMigration("invalid_migration")
+	invalidMigration.Up = []Operation{
 		&CreateTable{
 			Name: "users",
 			Columns: []Column{
-				{Name: "id", Type: "INVALID_TYPE", IsPK: true},
+				{Name: "id", Type: "INVALID_TYPE"},
 			},
 		},
 	}
 
-	migrator.Add(migration)
-
-	// Test Up with invalid migration
-	err = migrator.Up()
+	migrator.Add(invalidMigration)
+	err = migrator.UpWithBatch(true)
 	if err == nil {
-		t.Error("Migrator.Up() error = nil, want error")
+		t.Error("Migrator.UpWithBatch() expected error for invalid SQL")
 	}
 
-	// Check that no migrations were applied
-	applied, err := migrator.GetAppliedMigrations()
+	// Test transaction rollback
+	status, err := migrator.Status()
 	if err != nil {
-		t.Fatalf("Migrator.GetAppliedMigrations() error = %v", err)
+		t.Fatalf("Migrator.Status() error = %v", err)
 	}
 
-	if len(applied) != 0 {
-		t.Errorf("len(applied) = %v, want %v", len(applied), 0)
+	for _, s := range status {
+		if s.Applied != nil {
+			t.Error("migration applied despite error")
+		}
+	}
+
+	// Verify migrations table is empty
+	err = db.QueryRow("SELECT COUNT(*) FROM migrations").Scan(&count)
+	if err != nil {
+		t.Fatalf("Failed to query migrations table: %v", err)
+	}
+
+	if count > 0 {
+		t.Error("migrations table contains rows after failed migration")
 	}
 }

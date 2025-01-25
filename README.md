@@ -197,6 +197,22 @@ func createUserMigration() *migration.Migration {
                 {Name: "name", Type: "TEXT", IsNull: false},
                 {Name: "email", Type: "TEXT", IsNull: true},
             },
+            ForeignKeys: []migration.ForeignKey{
+                {
+                    Columns:      []string{"team_id"},
+                    RefTable:     "teams",
+                    RefColumns:   []string{"id"},
+                    OnDelete:     "CASCADE",
+                    OnUpdate:     "CASCADE",
+                },
+            },
+            Indexes: []migration.Index{
+                {
+                    Name:    "idx_users_email",
+                    Columns: []string{"email"},
+                    Unique:  true,
+                },
+            },
         },
     }
 
@@ -207,12 +223,68 @@ func createUserMigration() *migration.Migration {
 
     return m
 }
-
-// Add and run migration
-migrator := db.Migrator()
-migrator.Add(createUserMigration())
-err := migrator.Up()
 ```
+
+#### Running Migrations
+
+Theory provides several ways to run migrations:
+
+```go
+// Create a new migrator
+migrator := migration.NewMigrator(db)
+
+// Add migrations
+migrator.Add(createUserMigration())
+migrator.Add(createTeamMigration())
+
+// Run all pending migrations in a transaction
+err := migrator.Up()
+if err != nil {
+    panic(err)
+}
+
+// Roll back the last batch of migrations
+err = migrator.Down()
+if err != nil {
+    panic(err)
+}
+
+// Check migration status
+status, err := migrator.Status()
+if err != nil {
+    panic(err)
+}
+for _, s := range status {
+    fmt.Printf("Migration: %s, Applied: %v, Batch: %d\n", 
+        s.Migration.Name, 
+        s.Applied != nil,
+        s.Batch)
+}
+```
+
+#### Migration Features
+
+Theory's migration system supports:
+
+- **Foreign Keys**: Define relationships between tables with ON DELETE and ON UPDATE actions
+- **Indexes**: Create and drop indexes, including unique constraints
+- **Batch Migrations**: Run multiple migrations as a single transaction
+- **Rollback Support**: Easily roll back migrations by batch
+- **Migration Status**: Track which migrations have been applied and when
+- **Error Handling**: Robust error handling with descriptive messages
+- **Validation**: Type validation for SQLite column types
+
+#### Migration Operations
+
+Available migration operations:
+
+- `CreateTable`: Create a new table with columns, foreign keys, and indexes
+- `DropTable`: Remove an existing table
+- `AddColumn`: Add a new column to an existing table
+- `ModifyColumn`: Modify an existing column's properties
+- `CreateIndex`: Create a new index on specified columns
+- `DropIndex`: Remove an existing index
+- `AddForeignKey`: Add a new foreign key constraint
 
 ## Error Handling
 

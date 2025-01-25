@@ -26,8 +26,10 @@ type Operation interface {
 
 // CreateTable operation creates a new table
 type CreateTable struct {
-	Name    string
-	Columns []Column
+	Name       string
+	Columns    []Column
+	ForeignKeys []ForeignKey
+	Indexes    []Index
 }
 
 // Column represents a table column
@@ -38,6 +40,22 @@ type Column struct {
 	IsAuto    bool
 	IsNull    bool
 	MaxLength int
+}
+
+// ForeignKey represents a foreign key constraint
+type ForeignKey struct {
+	Columns      []string
+	RefTable     string
+	RefColumns   []string
+	OnDelete     string // CASCADE, SET NULL, RESTRICT, NO ACTION
+	OnUpdate     string // CASCADE, SET NULL, RESTRICT, NO ACTION
+}
+
+// Index represents a table index
+type Index struct {
+	Name      string
+	Columns   []string
+	IsUnique  bool
 }
 
 // DropTable operation drops a table
@@ -64,6 +82,30 @@ type ModifyColumn struct {
 	NewColumn Column
 }
 
+// CreateIndex operation creates an index
+type CreateIndex struct {
+	Table  string
+	Index  Index
+}
+
+// DropIndex operation drops an index
+type DropIndex struct {
+	Table string
+	Name  string
+}
+
+// AddForeignKey operation adds a foreign key constraint
+type AddForeignKey struct {
+	Table      string
+	ForeignKey ForeignKey
+}
+
+// DropForeignKey operation drops a foreign key constraint
+type DropForeignKey struct {
+	Table string
+	Name  string
+}
+
 // SQL generates SQL for CreateTable operation
 func (op *CreateTable) SQL() string {
 	var cols []string
@@ -81,7 +123,41 @@ func (op *CreateTable) SQL() string {
 		}
 		cols = append(cols, def)
 	}
-	return fmt.Sprintf("CREATE TABLE %s (\n\t%s\n)", op.Name, strings.Join(cols, ",\n\t"))
+
+	// Add foreign key constraints
+	for _, fk := range op.ForeignKeys {
+		def := fmt.Sprintf("FOREIGN KEY (%s) REFERENCES %s (%s)",
+			strings.Join(fk.Columns, ", "),
+			fk.RefTable,
+			strings.Join(fk.RefColumns, ", "))
+		
+		if fk.OnDelete != "" {
+			def += fmt.Sprintf(" ON DELETE %s", fk.OnDelete)
+		}
+		if fk.OnUpdate != "" {
+			def += fmt.Sprintf(" ON UPDATE %s", fk.OnUpdate)
+		}
+		cols = append(cols, def)
+	}
+
+	sql := fmt.Sprintf("CREATE TABLE %s (\n\t%s\n)", op.Name, strings.Join(cols, ",\n\t"))
+
+	// Create indexes
+	var indexes []string
+	for _, idx := range op.Indexes {
+		idxSQL := fmt.Sprintf("CREATE %sINDEX %s ON %s (%s)",
+			map[bool]string{true: "UNIQUE ", false: ""}[idx.IsUnique],
+			idx.Name,
+			op.Name,
+			strings.Join(idx.Columns, ", "))
+		indexes = append(indexes, idxSQL)
+	}
+
+	if len(indexes) > 0 {
+		sql += ";\n" + strings.Join(indexes, ";\n")
+	}
+
+	return sql
 }
 
 func (c *CreateTable) Args() []interface{} {
@@ -125,6 +201,61 @@ func (m *ModifyColumn) SQL() string {
 }
 
 func (m *ModifyColumn) Args() []interface{} {
+	return nil
+}
+
+// SQL generates SQL for CreateIndex operation
+func (c *CreateIndex) SQL() string {
+	return fmt.Sprintf("CREATE %sINDEX %s ON %s (%s)",
+		map[bool]string{true: "UNIQUE ", false: ""}[c.Index.IsUnique],
+		c.Index.Name,
+		c.Table,
+		strings.Join(c.Index.Columns, ", "))
+}
+
+func (c *CreateIndex) Args() []interface{} {
+	return nil
+}
+
+// SQL generates SQL for DropIndex operation
+func (d *DropIndex) SQL() string {
+	return fmt.Sprintf("DROP INDEX %s", d.Name)
+}
+
+func (d *DropIndex) Args() []interface{} {
+	return nil
+}
+
+// SQL generates SQL for AddForeignKey operation
+func (a *AddForeignKey) SQL() string {
+	sql := fmt.Sprintf("ALTER TABLE %s ADD CONSTRAINT %s_%s_fk FOREIGN KEY (%s) REFERENCES %s (%s)",
+		a.Table,
+		a.Table,
+		strings.Join(a.ForeignKey.Columns, "_"),
+		strings.Join(a.ForeignKey.Columns, ", "),
+		a.ForeignKey.RefTable,
+		strings.Join(a.ForeignKey.RefColumns, ", "))
+
+	if a.ForeignKey.OnDelete != "" {
+		sql += fmt.Sprintf(" ON DELETE %s", a.ForeignKey.OnDelete)
+	}
+	if a.ForeignKey.OnUpdate != "" {
+		sql += fmt.Sprintf(" ON UPDATE %s", a.ForeignKey.OnUpdate)
+	}
+
+	return sql
+}
+
+func (a *AddForeignKey) Args() []interface{} {
+	return nil
+}
+
+// SQL generates SQL for DropForeignKey operation
+func (d *DropForeignKey) SQL() string {
+	return fmt.Sprintf("ALTER TABLE %s DROP CONSTRAINT %s", d.Table, d.Name)
+}
+
+func (d *DropForeignKey) Args() []interface{} {
 	return nil
 }
 
