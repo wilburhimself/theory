@@ -16,7 +16,7 @@ type TestUser struct {
 func setupTestDB(t *testing.T) (*DB, func()) {
 	cfg := Config{
 		Driver: "sqlite3",
-		DSN:    ":memory:",
+		DSN:    ":memory:",  // Use in-memory mode
 	}
 
 	db, err := Connect(cfg)
@@ -24,11 +24,31 @@ func setupTestDB(t *testing.T) (*DB, func()) {
 		t.Fatalf("failed to connect to database: %v", err)
 	}
 
+	// Initialize migrator
+	err = db.migrator.Initialize()
+	if err != nil {
+		db.Close()
+		t.Fatalf("failed to initialize migrator: %v", err)
+	}
+
 	// Create test tables
 	err = db.AutoMigrate(&TestUser{})
 	if err != nil {
 		db.Close()
 		t.Fatalf("failed to create tables: %v", err)
+	}
+
+	// Verify table was created
+	var tableName string
+	row := db.conn.QueryRow("SELECT name FROM sqlite_master WHERE type='table' AND name='test_users'")
+	err = row.Scan(&tableName)
+	if err != nil {
+		db.Close()
+		t.Fatalf("failed to verify table creation: %v", err)
+	}
+	if tableName != "test_users" {
+		db.Close()
+		t.Fatal("test_users table was not created")
 	}
 
 	cleanup := func() {

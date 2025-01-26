@@ -359,3 +359,24 @@ func (db *DB) Delete(ctx context.Context, m interface{}) error {
 	_, err = db.conn.ExecContext(ctx, sql, pkValue)
 	return err
 }
+
+// BeginTx starts a new transaction with the given options
+func (db *DB) BeginTx(ctx context.Context, opts *sql.TxOptions) (*sql.Tx, error) {
+	return db.conn.BeginTx(ctx, opts)
+}
+
+// Begin starts a new transaction with default options
+func (db *DB) Begin(ctx context.Context) (*sql.Tx, error) {
+	return db.conn.BeginTx(ctx, nil)
+}
+
+// BeginTx starts a new transaction with the given options
+func (db *DB) BeginTxWithTxOptions(ctx context.Context, opts *TxOptions) (*Transaction, error) {
+	tx := NewTransaction(db)
+	return tx.Begin(ctx, opts)
+}
+
+// Begin starts a new transaction with default options
+func (db *DB) BeginWithTxOptions(ctx context.Context) (*Transaction, error) {
+	return db.BeginTxWithTxOptions(ctx, &TxOptions{})
+}
