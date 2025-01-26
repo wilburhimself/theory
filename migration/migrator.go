@@ -20,6 +20,7 @@ type MigrationRecord struct {
 	Name      string
 	Timestamp time.Time
 	Applied   time.Time
+	Batch     int
 }
 
 // NewMigrator creates a new migrator instance
@@ -42,45 +43,21 @@ func (m *Migrator) Initialize() error {
 			id TEXT PRIMARY KEY,
 			name TEXT NOT NULL,
 			timestamp INTEGER NOT NULL,
-			applied INTEGER NOT NULL
+			applied INTEGER NOT NULL,
+			batch INTEGER NOT NULL DEFAULT 1
 		)
 	`
 	_, err := m.db.Exec(sql)
 	return err
 }
 
-// GetAppliedMigrations returns all applied migrations
-func (m *Migrator) GetAppliedMigrations() ([]MigrationRecord, error) {
-	rows, err := m.db.Query("SELECT id, name, timestamp, applied FROM migrations")
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-
-	var records []MigrationRecord
-	for rows.Next() {
-		var record MigrationRecord
-		var timestamp, applied int64
-		err := rows.Scan(&record.ID, &record.Name, &timestamp, &applied)
-		if err != nil {
-			return nil, err
-		}
-		record.Timestamp = time.Unix(timestamp, 0)
-		record.Applied = time.Unix(applied, 0)
-		records = append(records, record)
-	}
-
-	return records, rows.Err()
-}
-
 // validateSQLType checks if a SQL type is valid for SQLite
 func (m *Migrator) validateSQLType(sqlType string) bool {
 	validTypes := map[string]bool{
 		"INTEGER": true,
-		"REAL":    true,
 		"TEXT":    true,
+		"REAL":    true,
 		"BLOB":    true,
-		"NULL":    true,
 	}
 	return validTypes[strings.ToUpper(sqlType)]
 }
@@ -91,30 +68,40 @@ func (m *Migrator) validateOperation(op Operation) error {
 	case *CreateTable:
 		for _, col := range o.Columns {
 			if !m.validateSQLType(col.Type) {
-				return fmt.Errorf("invalid SQL type '%s' for column '%s'", col.Type, col.Name)
+				return fmt.Errorf("invalid SQL type %s", col.Type)
 			}
 		}
 	case *AddColumn:
 		if !m.validateSQLType(o.Column.Type) {
-			return fmt.Errorf("invalid SQL type '%s' for column '%s'", o.Column.Type, o.Column.Name)
-		}
-	case *ModifyColumn:
-		if !m.validateSQLType(o.NewColumn.Type) {
-			return fmt.Errorf("invalid SQL type '%s' for column '%s'", o.NewColumn.Type, o.NewColumn.Name)
+			return fmt.Errorf("invalid SQL type %s", o.Column.Type)
 		}
 	}
 	return nil
 }
 
+// getNextBatchNumber gets the next batch number
+func (m *Migrator) getNextBatchNumber() (int, error) {
+	var batch int
+	err := m.db.QueryRow("SELECT COALESCE(MAX(batch), 0) + 1 FROM migrations").Scan(&batch)
+	if err != nil {
+		return 0, err
+	}
+	return batch, nil
+}
+
 // Up runs all pending migrations
 func (m *Migrator) Up() error {
+	return m.UpWithBatch(true)
+}
+
+// UpWithBatch runs all pending migrations, optionally using a transaction
+func (m *Migrator) UpWithBatch(useTx bool) error {
 	// Get applied migrations
-	records, err := m.GetAppliedMigrations()
+	records, err := m.getAppliedMigrations()
 	if err != nil {
 		return err
 	}
 
-	// Create a map of applied migration IDs
 	applied := make(map[string]bool)
 	for _, record := range records {
 		applied[record.ID] = true
@@ -125,59 +112,86 @@ func (m *Migrator) Up() error {
 		return m.migrations[i].Timestamp.Before(m.migrations[j].Timestamp)
 	})
 
+	// Get next batch number
+	batch, err := m.getNextBatchNumber()
+	if err != nil {
+		return err
+	}
+
+	// Start transaction if requested
+	var tx *sql.Tx
+	if useTx {
+		tx, err = m.db.Begin()
+		if err != nil {
+			return err
+		}
+		defer func() {
+			if err != nil {
+				tx.Rollback()
+			}
+		}()
+	}
+
 	// Run pending migrations
 	for _, migration := range m.migrations {
 		if !applied[migration.ID] {
-			// Validate operations before starting transaction
+			// Validate operations
 			for _, op := range migration.Up {
 				if err := m.validateOperation(op); err != nil {
-					return fmt.Errorf("invalid operation in migration %s: %w", migration.Name, err)
+					return fmt.Errorf("invalid operation in migration %s: %v", migration.Name, err)
 				}
 			}
 
-			// Start transaction
-			tx, err := m.db.Begin()
-			if err != nil {
-				return err
-			}
-
-			// Run migration operations
+			// Execute operations
 			for _, op := range migration.Up {
-				_, err := tx.Exec(op.SQL(), op.Args()...)
+				sql := op.SQL()
+				if useTx {
+					_, err = tx.Exec(sql)
+				} else {
+					_, err = m.db.Exec(sql)
+				}
 				if err != nil {
-					tx.Rollback()
-					return fmt.Errorf("failed to run migration %s: %w", migration.Name, err)
+					return fmt.Errorf("failed to execute migration %s: %v", migration.Name, err)
 				}
 			}
 
 			// Record migration
-			_, err = tx.Exec(
-				"INSERT INTO migrations (id, name, timestamp, applied) VALUES (?, ?, ?, ?)",
-				migration.ID,
-				migration.Name,
-				migration.Timestamp.Unix(),
-				time.Now().Unix(),
-			)
-			if err != nil {
-				tx.Rollback()
-				return fmt.Errorf("failed to record migration %s: %w", migration.Name, err)
+			now := time.Now().Unix()
+			sql := `
+				INSERT INTO migrations (id, name, timestamp, applied, batch)
+				VALUES (?, ?, ?, ?, ?)
+			`
+			if useTx {
+				_, err = tx.Exec(sql, migration.ID, migration.Name, migration.Timestamp.Unix(), now, batch)
+			} else {
+				_, err = m.db.Exec(sql, migration.ID, migration.Name, migration.Timestamp.Unix(), now, batch)
 			}
+			if err != nil {
+				return fmt.Errorf("failed to record migration %s: %v", migration.Name, err)
+			}
+		}
+	}
 
-			// Commit transaction
-			err = tx.Commit()
-			if err != nil {
-				return fmt.Errorf("failed to commit migration %s: %w", migration.Name, err)
-			}
+	// Commit transaction if used
+	if useTx {
+		err = tx.Commit()
+		if err != nil {
+			return fmt.Errorf("failed to commit transaction: %v", err)
 		}
 	}
 
 	return nil
 }
 
-// Down rolls back the last migration
+// Down rolls back the last batch of migrations
 func (m *Migrator) Down() error {
+	return m.DownWithBatch(true)
+}
+
+// DownWithBatch rolls back the last batch of migrations, optionally using a transaction
+func (m *Migrator) DownWithBatch(useTx bool) error {
 	// Get applied migrations
-	records, err := m.GetAppliedMigrations()
+	records, err := m.getAppliedMigrations()
 	if err != nil {
 		return err
 	}
@@ -186,53 +200,78 @@ func (m *Migrator) Down() error {
 		return nil
 	}
 
-	// Find the last applied migration
-	var lastRecord MigrationRecord
+	// Get last batch number
+	lastBatch := records[len(records)-1].Batch
+
+	// Filter migrations in last batch
+	var toRollback []MigrationRecord
 	for _, record := range records {
-		if lastRecord.Applied.Before(record.Applied) {
-			lastRecord = record
+		if record.Batch == lastBatch {
+			toRollback = append(toRollback, record)
 		}
 	}
 
-	// Find the migration
-	var migration *Migration
-	for _, m := range m.migrations {
-		if m.ID == lastRecord.ID {
-			migration = m
-			break
-		}
-	}
-
-	if migration == nil {
-		return fmt.Errorf("migration %s not found", lastRecord.ID)
-	}
-
-	// Start transaction
-	tx, err := m.db.Begin()
-	if err != nil {
-		return err
-	}
-
-	// Run migration operations
-	for _, op := range migration.Down {
-		_, err := tx.Exec(op.SQL(), op.Args()...)
+	// Start transaction if requested
+	var tx *sql.Tx
+	if useTx {
+		tx, err = m.db.Begin()
 		if err != nil {
-			tx.Rollback()
-			return fmt.Errorf("failed to rollback migration %s: %w", migration.Name, err)
+			return err
+		}
+		defer func() {
+			if err != nil {
+				tx.Rollback()
+			}
+		}()
+	}
+
+	// Roll back migrations in reverse order
+	for i := len(toRollback) - 1; i >= 0; i-- {
+		record := toRollback[i]
+
+		// Find migration
+		var migration *Migration
+		for _, m := range m.migrations {
+			if m.ID == record.ID {
+				migration = m
+				break
+			}
+		}
+		if migration == nil {
+			return fmt.Errorf("migration %s not found", record.ID)
+		}
+
+		// Execute down operations
+		for _, op := range migration.Down {
+			sql := op.SQL()
+			if useTx {
+				_, err = tx.Exec(sql)
+			} else {
+				_, err = m.db.Exec(sql)
+			}
+			if err != nil {
+				return fmt.Errorf("failed to roll back migration %s: %v", migration.Name, err)
+			}
+		}
+
+		// Remove migration record
+		sql := "DELETE FROM migrations WHERE id = ?"
+		if useTx {
+			_, err = tx.Exec(sql, record.ID)
+		} else {
+			_, err = m.db.Exec(sql, record.ID)
+		}
+		if err != nil {
+			return fmt.Errorf("failed to remove migration record %s: %v", migration.Name, err)
 		}
 	}
 
-	// Remove migration record
-	_, err = tx.Exec("DELETE FROM migrations WHERE id = ?", migration.ID)
-	if err != nil {
-		tx.Rollback()
-		return fmt.Errorf("failed to remove migration record %s: %w", migration.Name, err)
-	}
-
-	// Commit transaction
-	err = tx.Commit()
-	if err != nil {
-		return fmt.Errorf("failed to commit rollback of migration %s: %w", migration.Name, err)
+	// Commit transaction if used
+	if useTx {
+		err = tx.Commit()
+		if err != nil {
+			return fmt.Errorf("failed to commit transaction: %v", err)
+		}
 	}
 
 	return nil
@@ -242,49 +281,98 @@ func (m *Migrator) Down() error {
 func (m *Migrator) Status() ([]struct {
 	Migration *Migration
 	Applied   *time.Time
+	Batch     int
 }, error) {
+	// Initialize migrations table if it doesn't exist
+	err := m.Initialize()
+	if err != nil {
+		return nil, fmt.Errorf("failed to initialize migrations table: %v", err)
+	}
+
 	// Get applied migrations
-	records, err := m.GetAppliedMigrations()
+	records, err := m.getAppliedMigrations()
 	if err != nil {
 		return nil, err
 	}
 
-	// Create a map of applied migrations
-	applied := make(map[string]time.Time)
+	applied := make(map[string]struct {
+		time  time.Time
+		batch int
+	})
 	for _, record := range records {
-		applied[record.ID] = record.Applied
+		applied[record.ID] = struct {
+			time  time.Time
+			batch int
+		}{
+			time:  record.Applied,
+			batch: record.Batch,
+		}
 	}
 
-	// Sort migrations by timestamp
-	sort.Slice(m.migrations, func(i, j int) bool {
-		return m.migrations[i].Timestamp.Before(m.migrations[j].Timestamp)
-	})
-
-	// Create status list
+	// Build status
 	var status []struct {
 		Migration *Migration
 		Applied   *time.Time
+		Batch     int
 	}
 
 	for _, migration := range m.migrations {
-		if appliedTime, ok := applied[migration.ID]; ok {
+		if record, ok := applied[migration.ID]; ok {
+			appliedTime := record.time
 			status = append(status, struct {
 				Migration *Migration
 				Applied   *time.Time
+				Batch     int
 			}{
 				Migration: migration,
 				Applied:   &appliedTime,
+				Batch:     record.batch,
 			})
 		} else {
 			status = append(status, struct {
 				Migration *Migration
 				Applied   *time.Time
+				Batch     int
 			}{
 				Migration: migration,
 				Applied:   nil,
+				Batch:     0,
 			})
 		}
 	}
 
 	return status, nil
+}
+
+// getAppliedMigrations returns all applied migrations
+func (m *Migrator) getAppliedMigrations() ([]MigrationRecord, error) {
+	// Initialize migrations table if it doesn't exist
+	err := m.Initialize()
+	if err != nil {
+		return nil, fmt.Errorf("failed to initialize migrations table: %v", err)
+	}
+
+	rows, err := m.db.Query(`
+		SELECT id, name, timestamp, applied, batch
+		FROM migrations
+		ORDER BY timestamp ASC
+	`)
+	if err != nil && err != sql.ErrNoRows {
+		return nil, err
+	}
+
+	var records []MigrationRecord
+	for rows.Next() {
+		var record MigrationRecord
+		var timestamp, applied int64
+		err := rows.Scan(&record.ID, &record.Name, &timestamp, &applied, &record.Batch)
+		if err != nil {
+			return nil, err
+		}
+		record.Timestamp = time.Unix(timestamp, 0)
+		record.Applied = time.Unix(applied, 0)
+		records = append(records, record)
+	}
+
+	return records, nil
 }
